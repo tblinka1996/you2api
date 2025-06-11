@@ -643,11 +643,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// 处理问题
 		if entry.Question != "" {
 			questionTokenCount, _ := countTokensForMessages([]Message{{Role: "user", Content: entry.Question}})
-			fmt.Printf("问题token数量: %d, 内容: %s\n", questionTokenCount, entry.Question)
 
 			// 如果问题较长，上传为文件
 			if questionTokenCount >= 30 {
-				fmt.Printf("问题较长，上传为文件: %s\n", entry.Question)
 				// 获取nonce
 				_, err := getNonce(dsToken)
 				if err != nil {
@@ -691,11 +689,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// 处理回答 - 只对长回答进行文件上传
 		if entry.Answer != "" {
 			answerTokenCount, _ := countTokensForMessages([]Message{{Role: "assistant", Content: entry.Answer}})
-			fmt.Printf("回答token数量: %d, 内容: %s\n", answerTokenCount, entry.Answer)
 			
 			// 如果回答较长，上传为文件
 			if answerTokenCount >= 30 {
-				fmt.Printf("回答较长，上传为文件: %s\n", entry.Answer)
 				// 获取nonce
 				_, err := getNonce(dsToken)
 				if err != nil {
@@ -1255,11 +1251,11 @@ func ensurePlainText(content string) string {
 func main() {
 	http.HandleFunc("/v1/chat/completions", Handler)
 	
-	fmt.Println("You2API 服务器启动在端口 12001")
+	fmt.Println("You2API 服务器启动在端口 8080")
 	fmt.Println("支持 OpenAI Vision API 兼容接口")
-	fmt.Println("访问地址: http://localhost:12001/v1/chat/completions")
+	fmt.Println("访问地址: http://localhost:8080/v1/chat/completions")
 	
-	if err := http.ListenAndServe(":12001", nil); err != nil {
+	if err := http.ListenAndServe(":8080", nil); err != nil {
 		fmt.Printf("服务器启动失败: %v\n", err)
 	}
 }
