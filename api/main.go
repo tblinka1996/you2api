@@ -1,8 +1,9 @@
-package handler
+package main
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -98,10 +99,22 @@ type OpenAIRequest struct {
 	Model    string    `json:"model"`
 }
 
-// Message 定义了 OpenAI 聊天消息的结构。
+// Message 定义了 OpenAI 聊天消息的结构，支持多模态内容。
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string      `json:"role"`
+	Content interface{} `json:"content"` // 可以是 string 或 []ContentPart
+}
+
+// ContentPart 定义了消息内容的一部分，支持文本和图片。
+type ContentPart struct {
+	Type     string    `json:"type"`
+	Text     string    `json:"text,omitempty"`
+	ImageURL *ImageURL `json:"image_url,omitempty"`
+}
+
+// ImageURL 定义了图片 URL 的结构。
+type ImageURL struct {
+	URL string `json:"url"`
 }
 
 // OpenAIResponse 定义了 OpenAI API 非流式响应的结构。
@@ -220,6 +233,245 @@ type ChatEntry struct {
 	Answer   string `json:"answer"`
 }
 
+// extractTextContent 从消息内容中提取文本部分
+func extractTextContent(content interface{}) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []interface{}:
+		var textParts []string
+		for _, part := range v {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if partType, exists := partMap["type"]; exists && partType == "text" {
+					if text, exists := partMap["text"]; exists {
+						if textStr, ok := text.(string); ok {
+							textParts = append(textParts, textStr)
+						}
+					}
+				}
+			}
+		}
+		return strings.Join(textParts, " ")
+	default:
+		return ""
+	}
+}
+
+// hasImageContent 检查消息是否包含图片内容
+func hasImageContent(content interface{}) bool {
+	switch v := content.(type) {
+	case []interface{}:
+		for _, part := range v {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if partType, exists := partMap["type"]; exists && partType == "image_url" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// processImageContent 处理消息中的图片内容，上传图片并返回处理后的文本和sources
+func processImageContent(content interface{}, dsToken string) (string, string, error) {
+	textContent := extractTextContent(content)
+	
+	if !hasImageContent(content) {
+		return textContent, "", nil
+	}
+	
+	var sources []map[string]interface{}
+	
+	switch v := content.(type) {
+	case []interface{}:
+		for _, part := range v {
+			if partMap, ok := part.(map[string]interface{}); ok {
+				if partType, exists := partMap["type"]; exists && partType == "image_url" {
+					if imageURL, exists := partMap["image_url"]; exists {
+						if imageURLMap, ok := imageURL.(map[string]interface{}); ok {
+							if url, exists := imageURLMap["url"]; exists {
+								if urlStr, ok := url.(string); ok {
+									filename, userFilename, err := processImage(urlStr, dsToken)
+									if err != nil {
+										return "", "", fmt.Errorf("处理图片失败: %v", err)
+									}
+									
+									// 添加到sources
+									source := map[string]interface{}{
+										"filename":      filename,
+										"size_bytes":    0,
+										"source_type":   "user_file",
+										"user_filename": userFilename,
+									}
+									sources = append(sources, source)
+									
+									// 在文本中添加图片引用
+									textContent += fmt.Sprintf("\n查看这个图片文件：%s", userFilename)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// 将sources转换为JSON字符串
+	sourcesJSON := ""
+	if len(sources) > 0 {
+		if sourcesBytes, err := json.Marshal(sources); err == nil {
+			sourcesJSON = string(sourcesBytes)
+		}
+	}
+	
+	return textContent, sourcesJSON, nil
+}
+
+// processImage 处理单个图片（base64或URL），返回上传后的文件名
+func processImage(imageURL, dsToken string) (string, string, error) {
+	var imageData []byte
+	var err error
+	var originalFilename string
+	
+	if strings.HasPrefix(imageURL, "data:image/") {
+		// 处理base64图片
+		imageData, originalFilename, err = decodeBase64Image(imageURL)
+		if err != nil {
+			return "", "", fmt.Errorf("解码base64图片失败: %v", err)
+		}
+	} else {
+		// 处理URL图片
+		imageData, originalFilename, err = downloadImage(imageURL)
+		if err != nil {
+			return "", "", fmt.Errorf("下载图片失败: %v", err)
+		}
+	}
+	
+	// 创建临时文件
+	tempFile, err := os.CreateTemp("", "upload_*"+filepath.Ext(originalFilename))
+	if err != nil {
+		return "", "", fmt.Errorf("创建临时文件失败: %v", err)
+	}
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
+	
+	// 写入图片数据
+	if _, err := tempFile.Write(imageData); err != nil {
+		return "", "", fmt.Errorf("写入临时文件失败: %v", err)
+	}
+	tempFile.Close()
+	
+	// 上传文件
+	uploadResp, err := uploadFile(dsToken, tempFile.Name())
+	if err != nil {
+		return "", "", fmt.Errorf("上传文件失败: %v", err)
+	}
+	
+	return uploadResp.Filename, uploadResp.UserFilename, nil
+}
+
+// decodeBase64Image 解码base64图片数据
+func decodeBase64Image(dataURL string) ([]byte, string, error) {
+	// 解析data URL格式: data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA...
+	parts := strings.Split(dataURL, ",")
+	if len(parts) != 2 {
+		return nil, "", fmt.Errorf("无效的data URL格式")
+	}
+	
+	// 提取MIME类型
+	header := parts[0]
+	var extension string
+	if strings.Contains(header, "image/png") {
+		extension = ".png"
+	} else if strings.Contains(header, "image/jpeg") || strings.Contains(header, "image/jpg") {
+		extension = ".jpg"
+	} else if strings.Contains(header, "image/gif") {
+		extension = ".gif"
+	} else if strings.Contains(header, "image/webp") {
+		extension = ".webp"
+	} else {
+		extension = ".png" // 默认
+	}
+	
+	// 解码base64数据
+	imageData, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, "", fmt.Errorf("base64解码失败: %v", err)
+	}
+	
+	// 生成随机文件名
+	filename := fmt.Sprintf("%s_image%s", generateRandomString(6), extension)
+	
+	return imageData, filename, nil
+}
+
+// downloadImage 从URL下载图片
+func downloadImage(imageURL string) ([]byte, string, error) {
+	resp, err := http.Get(imageURL)
+	if err != nil {
+		return nil, "", fmt.Errorf("下载图片失败: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("下载图片失败，状态码: %d", resp.StatusCode)
+	}
+	
+	imageData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, "", fmt.Errorf("读取图片数据失败: %v", err)
+	}
+	
+	// 从URL中提取文件名
+	filename := filepath.Base(imageURL)
+	if filename == "." || filename == "/" {
+		filename = "downloaded_image.jpg"
+	}
+	
+	return imageData, filename, nil
+}
+
+// generateRandomString 生成指定长度的随机字符串
+func generateRandomString(length int) string {
+	const charset = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[rand.Intn(len(charset))]
+	}
+	return string(b)
+}
+
+// countTokens 计算消息的token数量，包括图片token估算
+func countTokens(content interface{}) int {
+	textContent := extractTextContent(content)
+	baseTokens := len(strings.Fields(textContent)) // 简单的单词计数估算
+	
+	// 如果包含图片，每张图片估算85个token
+	if hasImageContent(content) {
+		imageCount := 0
+		if v, ok := content.([]interface{}); ok {
+			for _, part := range v {
+				if partMap, ok := part.(map[string]interface{}); ok {
+					if partType, exists := partMap["type"]; exists && partType == "image_url" {
+						imageCount++
+					}
+				}
+			}
+		}
+		baseTokens += imageCount * 85
+	}
+	
+	return baseTokens
+}
+
+// convertSystemToUser 将system消息转换为user消息，提取文本内容
+func convertSystemToUser(message Message) Message {
+	return Message{
+		Role:    "user",
+		Content: extractTextContent(message.Content),
+	}
+}
+
 // Handler 是处理所有传入 HTTP 请求的主处理函数。
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// 处理 /v1/models 请求（列出可用模型）
@@ -302,12 +554,18 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	originalModel = openAIReq.Model
 
 	// 转换 system 消息为 user 消息
-	openAIReq.Messages = convertSystemToUser(openAIReq.Messages)
+	openAIReq.Messages = convertSystemToUserMessages(openAIReq.Messages)
 
 	// 打印OpenAI消息
 	fmt.Printf("\n=== 接收到的OpenAI消息 ===\n")
 	for i, msg := range openAIReq.Messages {
-		fmt.Printf("消息 %d: 角色=%s, 内容=%s\n", i, msg.Role, msg.Content)
+		textContent := extractTextContent(msg.Content)
+		hasImages := hasImageContent(msg.Content)
+		if hasImages {
+			fmt.Printf("消息 %d: 角色=%s, 文本内容=%s [包含图片]\n", i, msg.Role, textContent)
+		} else {
+			fmt.Printf("消息 %d: 角色=%s, 内容=%s\n", i, msg.Role, textContent)
+		}
 	}
 	fmt.Printf("===================\n\n")
 
@@ -332,30 +590,30 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 					Answer:   currentAnswer,
 				})
 				// 重置状态
-				currentQuestion = msg.Content
+				currentQuestion = extractTextContent(msg.Content)
 				currentAnswer = ""
 				hasQuestion = true
 				hasAnswer = false
 			} else if hasQuestion {
 				// 如果已经有问题但没有回答，合并问题
-				currentQuestion += "\n" + msg.Content
+				currentQuestion += "\n" + extractTextContent(msg.Content)
 			} else {
 				// 新的问题
-				currentQuestion = msg.Content
+				currentQuestion = extractTextContent(msg.Content)
 				hasQuestion = true
 			}
 		} else if msg.Role == "assistant" {
 			if hasQuestion {
 				// 如果有问题，设置回答
-				currentAnswer = msg.Content
+				currentAnswer = extractTextContent(msg.Content)
 				hasAnswer = true
 			} else if hasAnswer {
 				// 如果已经有回答但没有问题，合并回答
-				currentAnswer += "\n" + msg.Content
+				currentAnswer += "\n" + extractTextContent(msg.Content)
 			} else {
 				// 没有问题的回答，创建空问题
 				currentQuestion = ""
-				currentAnswer = msg.Content
+				currentAnswer = extractTextContent(msg.Content)
 				hasQuestion = true
 				hasAnswer = true
 			}
@@ -384,7 +642,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 		// 处理问题
 		if entry.Question != "" {
-			questionTokenCount, _ := countTokens([]Message{{Role: "user", Content: entry.Question}})
+			questionTokenCount, _ := countTokensForMessages([]Message{{Role: "user", Content: entry.Question}})
 
 			// 如果问题较长，上传为文件
 			if questionTokenCount >= 30 {
@@ -428,45 +686,50 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 处理回答
+		// 处理回答 - 只对长回答进行文件上传
 		if entry.Answer != "" {
-			// 获取nonce
-			_, err := getNonce(dsToken)
-			if err != nil {
-				fmt.Printf("获取nonce失败: %v\n", err)
-				http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
-				return
+			answerTokenCount, _ := countTokensForMessages([]Message{{Role: "assistant", Content: entry.Answer}})
+			
+			// 如果回答较长，上传为文件
+			if answerTokenCount >= 30 {
+				// 获取nonce
+				_, err := getNonce(dsToken)
+				if err != nil {
+					fmt.Printf("获取nonce失败: %v\n", err)
+					http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
+					return
+				}
+
+				// 创建回答临时文件
+				answerShortFileName := generateShortFileName()
+				answerTempFile := answerShortFileName + ".txt"
+
+				if err := os.WriteFile(answerTempFile, addUTF8BOM(entry.Answer), 0644); err != nil {
+					fmt.Printf("创建回答文件失败: %v\n", err)
+					http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+					return
+				}
+				defer os.Remove(answerTempFile)
+
+				// 上传回答文件
+				answerUploadResp, err := uploadFile(dsToken, answerTempFile)
+				if err != nil {
+					fmt.Printf("上传回答文件失败: %v\n", err)
+					http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+					return
+				}
+
+				// 添加回答文件源信息
+				sources = append(sources, map[string]interface{}{
+					"source_type":   "user_file",
+					"filename":      answerUploadResp.Filename,
+					"user_filename": answerUploadResp.UserFilename,
+					"size_bytes":    len(entry.Answer),
+				})
+
+				// 更新回答为文件引用
+				entry.Answer = fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(answerUploadResp.UserFilename, ".txt"))
 			}
-
-			// 创建回答临时文件
-			answerShortFileName := generateShortFileName()
-			answerTempFile := answerShortFileName + ".txt"
-
-			if err := os.WriteFile(answerTempFile, addUTF8BOM(entry.Answer), 0644); err != nil {
-				fmt.Printf("创建回答文件失败: %v\n", err)
-				http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-				return
-			}
-			defer os.Remove(answerTempFile)
-
-			// 上传回答文件
-			answerUploadResp, err := uploadFile(dsToken, answerTempFile)
-			if err != nil {
-				fmt.Printf("上传回答文件失败: %v\n", err)
-				http.Error(w, "Failed to upload file", http.StatusInternalServerError)
-				return
-			}
-
-			// 添加回答文件源信息
-			sources = append(sources, map[string]interface{}{
-				"source_type":   "user_file",
-				"filename":      answerUploadResp.Filename,
-				"user_filename": answerUploadResp.UserFilename,
-				"size_bytes":    len(entry.Answer),
-			})
-
-			// 更新回答为文件引用
-			entry.Answer = fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(answerUploadResp.UserFilename, ".txt"))
 		}
 	}
 
@@ -488,7 +751,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// 处理最后一条消息
 	lastMessage := openAIReq.Messages[len(openAIReq.Messages)-1]
-	lastMessageTokens, err := countTokens([]Message{lastMessage})
+	lastMessageTokens, err := countTokensForMessages([]Message{lastMessage})
 	if err != nil {
 		http.Error(w, "Failed to count tokens", http.StatusInternalServerError)
 		return
@@ -528,6 +791,26 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		q.Add("selectedChatMode", "custom")
 	}
 
+	// 处理最后一条消息的内容（包括图片）
+	var finalQuery string
+	var imageSources string
+	
+	// 检查是否包含图片内容
+	if hasImageContent(lastMessage.Content) {
+		// 处理图片内容
+		textContent, imageSourcesJSON, err := processImageContent(lastMessage.Content, dsToken)
+		if err != nil {
+			fmt.Printf("处理图片内容失败: %v\n", err)
+			http.Error(w, "Failed to process image content", http.StatusInternalServerError)
+			return
+		}
+		finalQuery = textContent
+		imageSources = imageSourcesJSON
+	} else {
+		// 纯文本内容
+		finalQuery = extractTextContent(lastMessage.Content)
+	}
+
 	// 如果最后一条消息超过限制，使用文件上传
 	if lastMessageTokens > MaxContextTokens {
 		// 获取 nonce - 不再需要nonce
@@ -543,7 +826,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		tempFile := shortFileName + ".txt"
 
 		// 确保使用UTF-8编码写入文件，添加BOM标记
-		if err := os.WriteFile(tempFile, addUTF8BOM(lastMessage.Content), 0644); err != nil {
+		if err := os.WriteFile(tempFile, addUTF8BOM(finalQuery), 0644); err != nil {
 			fmt.Printf("创建临时文件失败: %v\n", err)
 			http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
 			return
@@ -563,23 +846,28 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			"source_type":   "user_file",
 			"filename":      uploadResp.Filename,
 			"user_filename": uploadResp.UserFilename,
-			"size_bytes":    len(lastMessage.Content),
+			"size_bytes":    len(finalQuery),
 		})
 
-		// 添加 sources 参数
+		// 使用文件引用作为查询，确保包含.txt后缀
+		finalQuery = fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(uploadResp.UserFilename, ".txt"))
+	}
+
+	// 合并图片sources和其他sources
+	if imageSources != "" {
+		var imageSourcesList []map[string]interface{}
+		if err := json.Unmarshal([]byte(imageSources), &imageSourcesList); err == nil {
+			sources = append(sources, imageSourcesList...)
+		}
+	}
+
+	// 添加 sources 参数
+	if len(sources) > 0 {
 		sourcesJSON, _ := json.Marshal(sources)
 		q.Add("sources", string(sourcesJSON))
-
-		// 使用文件引用作为查询，确保包含.txt后缀
-		q.Add("q", fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(uploadResp.UserFilename, ".txt")))
-	} else {
-		// 如果有之前上传的文件，添加 sources
-		if len(sources) > 0 {
-			sourcesJSON, _ := json.Marshal(sources)
-			q.Add("sources", string(sourcesJSON))
-		}
-		q.Add("q", lastMessage.Content)
 	}
+
+	q.Add("q", finalQuery)
 
 	q.Add("chat", string(chatHistoryJSON))
 	youReq.URL.RawQuery = q.Encode()
@@ -888,34 +1176,18 @@ func uploadFile(dsToken, filePath string) (*UploadResponse, error) {
 	return &uploadResp, nil
 }
 
-// 计算消息的 token 数（使用字符估算方法）
-func countTokens(messages []Message) (int, error) {
+// 计算消息的 token 数（使用字符估算方法），支持多模态内容
+func countTokensForMessages(messages []Message) (int, error) {
 	totalTokens := 0
 	for _, msg := range messages {
-		content := msg.Content
-		englishCount := 0
-		chineseCount := 0
-
-		// 遍历每个字符
-		for _, r := range content {
-			if r <= 127 { // ASCII 字符（英文和符号）
-				englishCount++
-			} else { // 非 ASCII 字符（中文等）
-				chineseCount++
-			}
-		}
-
-		// 计算 tokens：英文字符 * 0.3 + 中文字符 * 0.6
-		tokens := int(float64(englishCount)*0.3 + float64(chineseCount)*1)
-
-		// 加上角色名的 token（约 2 个）
-		totalTokens += tokens + 2
+		tokens := countTokens(msg.Content)
+		totalTokens += tokens + 2 // 加上角色名的 token（约 2 个）
 	}
 	return totalTokens, nil
 }
 
-// 将 system 消息转换为第一条 user 消息
-func convertSystemToUser(messages []Message) []Message {
+// 将 system 消息转换为第一条 user 消息，支持多模态内容
+func convertSystemToUserMessages(messages []Message) []Message {
 	if len(messages) == 0 {
 		return messages
 	}
@@ -930,7 +1202,7 @@ func convertSystemToUser(messages []Message) []Message {
 			if systemContent.Len() > 0 {
 				systemContent.WriteString("\n")
 			}
-			systemContent.WriteString(msg.Content)
+			systemContent.WriteString(extractTextContent(msg.Content))
 			systemFound = true
 		} else {
 			newMessages = append(newMessages, msg)
@@ -974,4 +1246,16 @@ func ensurePlainText(content string) string {
 		}
 	}
 	return result.String()
+}
+
+func main() {
+	http.HandleFunc("/v1/chat/completions", Handler)
+	
+	fmt.Println("You2API 服务器启动在端口 8080")
+	fmt.Println("支持 OpenAI Vision API 兼容接口")
+	fmt.Println("访问地址: http://localhost:8080/v1/chat/completions")
+	
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		fmt.Printf("服务器启动失败: %v\n", err)
+	}
 }
