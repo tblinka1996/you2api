@@ -1,4 +1,4 @@
-package handler
+package main
 
 import (
 	"bufio"
@@ -643,9 +643,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		// 处理问题
 		if entry.Question != "" {
 			questionTokenCount, _ := countTokensForMessages([]Message{{Role: "user", Content: entry.Question}})
+			fmt.Printf("问题token数量: %d, 内容: %s\n", questionTokenCount, entry.Question)
 
 			// 如果问题较长，上传为文件
 			if questionTokenCount >= 30 {
+				fmt.Printf("问题较长，上传为文件: %s\n", entry.Question)
 				// 获取nonce
 				_, err := getNonce(dsToken)
 				if err != nil {
@@ -686,45 +688,52 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// 处理回答
+		// 处理回答 - 只对长回答进行文件上传
 		if entry.Answer != "" {
-			// 获取nonce
-			_, err := getNonce(dsToken)
-			if err != nil {
-				fmt.Printf("获取nonce失败: %v\n", err)
-				http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
-				return
+			answerTokenCount, _ := countTokensForMessages([]Message{{Role: "assistant", Content: entry.Answer}})
+			fmt.Printf("回答token数量: %d, 内容: %s\n", answerTokenCount, entry.Answer)
+			
+			// 如果回答较长，上传为文件
+			if answerTokenCount >= 30 {
+				fmt.Printf("回答较长，上传为文件: %s\n", entry.Answer)
+				// 获取nonce
+				_, err := getNonce(dsToken)
+				if err != nil {
+					fmt.Printf("获取nonce失败: %v\n", err)
+					http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
+					return
+				}
+
+				// 创建回答临时文件
+				answerShortFileName := generateShortFileName()
+				answerTempFile := answerShortFileName + ".txt"
+
+				if err := os.WriteFile(answerTempFile, addUTF8BOM(entry.Answer), 0644); err != nil {
+					fmt.Printf("创建回答文件失败: %v\n", err)
+					http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
+					return
+				}
+				defer os.Remove(answerTempFile)
+
+				// 上传回答文件
+				answerUploadResp, err := uploadFile(dsToken, answerTempFile)
+				if err != nil {
+					fmt.Printf("上传回答文件失败: %v\n", err)
+					http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+					return
+				}
+
+				// 添加回答文件源信息
+				sources = append(sources, map[string]interface{}{
+					"source_type":   "user_file",
+					"filename":      answerUploadResp.Filename,
+					"user_filename": answerUploadResp.UserFilename,
+					"size_bytes":    len(entry.Answer),
+				})
+
+				// 更新回答为文件引用
+				entry.Answer = fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(answerUploadResp.UserFilename, ".txt"))
 			}
-
-			// 创建回答临时文件
-			answerShortFileName := generateShortFileName()
-			answerTempFile := answerShortFileName + ".txt"
-
-			if err := os.WriteFile(answerTempFile, addUTF8BOM(entry.Answer), 0644); err != nil {
-				fmt.Printf("创建回答文件失败: %v\n", err)
-				http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-				return
-			}
-			defer os.Remove(answerTempFile)
-
-			// 上传回答文件
-			answerUploadResp, err := uploadFile(dsToken, answerTempFile)
-			if err != nil {
-				fmt.Printf("上传回答文件失败: %v\n", err)
-				http.Error(w, "Failed to upload file", http.StatusInternalServerError)
-				return
-			}
-
-			// 添加回答文件源信息
-			sources = append(sources, map[string]interface{}{
-				"source_type":   "user_file",
-				"filename":      answerUploadResp.Filename,
-				"user_filename": answerUploadResp.UserFilename,
-				"size_bytes":    len(entry.Answer),
-			})
-
-			// 更新回答为文件引用
-			entry.Answer = fmt.Sprintf("查看这个文件并且直接与文件内容进行聊天：%s.txt", strings.TrimSuffix(answerUploadResp.UserFilename, ".txt"))
 		}
 	}
 
@@ -1241,4 +1250,16 @@ func ensurePlainText(content string) string {
 		}
 	}
 	return result.String()
+}
+
+func main() {
+	http.HandleFunc("/v1/chat/completions", Handler)
+	
+	fmt.Println("You2API 服务器启动在端口 12001")
+	fmt.Println("支持 OpenAI Vision API 兼容接口")
+	fmt.Println("访问地址: http://localhost:12001/v1/chat/completions")
+	
+	if err := http.ListenAndServe(":12001", nil); err != nil {
+		fmt.Printf("服务器启动失败: %v\n", err)
+	}
 }
