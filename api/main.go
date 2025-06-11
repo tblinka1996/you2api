@@ -55,6 +55,19 @@ func isAgentModel(modelID string) bool {
 	return false
 }
 
+// 新增：检查模型是否为搜索模型（带-search后缀）
+func isSearchModel(modelID string) bool {
+	return strings.HasSuffix(modelID, "-search")
+}
+
+// 新增：获取基础模型名（移除-search后缀）
+func getBaseModelName(modelID string) string {
+	if isSearchModel(modelID) {
+		return strings.TrimSuffix(modelID, "-search")
+	}
+	return modelID
+}
+
 // TokenCount 定义了 token 计数的结构
 type TokenCount struct {
 	PromptTokens     int `json:"prompt_tokens"`
@@ -195,6 +208,16 @@ func getReverseModelMap() map[string]string {
 
 // mapModelName 将 OpenAI 模型名称映射到 You.com 模型名称。
 func mapModelName(openAIModel string) string {
+	// 检查是否为搜索模型（带-search后缀）
+	if strings.HasSuffix(openAIModel, "-search") {
+		// 移除-search后缀，获取基础模型名
+		baseModel := strings.TrimSuffix(openAIModel, "-search")
+		if mappedModel, exists := modelMap[baseModel]; exists {
+			return mappedModel
+		}
+		return "deepseek_v3" // 默认模型
+	}
+	
 	if mappedModel, exists := modelMap[openAIModel]; exists {
 		return mappedModel
 	}
@@ -208,6 +231,21 @@ func reverseMapModelName(youModel string) string {
 		return mappedModel
 	}
 	return "deepseek-chat" // 默认模型
+}
+
+// reverseMapModelNameWithSearch 将 You.com 模型名称映射回 OpenAI 模型名称，保持搜索后缀
+func reverseMapModelNameWithSearch(youModel string, isSearchRequest bool) string {
+	reverseMap := getReverseModelMap()
+	baseModel := "deepseek-chat" // 默认模型
+	
+	if mappedModel, exists := reverseMap[youModel]; exists {
+		baseModel = mappedModel
+	}
+	
+	if isSearchRequest {
+		return baseModel + "-search"
+	}
+	return baseModel
 }
 
 // originalModel 存储原始的 OpenAI 模型名称。
@@ -486,11 +524,19 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		models := make([]ModelDetail, 0, len(modelMap))
+		models := make([]ModelDetail, 0, len(modelMap)*2) // 预留空间给搜索模型
 		created := time.Now().Unix()
 		for modelID := range modelMap {
+			// 添加普通模型
 			models = append(models, ModelDetail{
 				ID:      modelID,
+				Object:  "model",
+				Created: created,
+				OwnedBy: "organization-owner",
+			})
+			// 添加对应的搜索模型
+			models = append(models, ModelDetail{
+				ID:      modelID + "-search",
 				Object:  "model",
 				Created: created,
 				OwnedBy: "organization-owner",
@@ -780,10 +826,22 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	// 新增：根据模型类型设置不同的参数
 	isAgent := isAgentModel(openAIReq.Model)
+	isSearch := isSearchModel(openAIReq.Model)
+	baseModel := getBaseModelName(openAIReq.Model)
+	
 	if isAgent {
 		// 新增：Agent模型: 只使用selectedChatMode=agent模型ID
 		fmt.Printf("使用Agent模型: %s\n", openAIReq.Model)
 		q.Add("selectedChatMode", openAIReq.Model) // 修改：直接使用模型ID作为chatMode
+	} else if isSearch {
+		// 新增：搜索模型: 使用基础模型但启用搜索功能
+		fmt.Printf("使用搜索模型: %s (基础模型: %s, 映射为: %s)\n", openAIReq.Model, baseModel, mapModelName(baseModel))
+		q.Add("selectedAiModel", mapModelName(baseModel))
+		q.Add("selectedChatMode", "default") // 使用default模式并启用搜索
+		// 根据you.com的实际API，可能需要以下参数来启用搜索
+		q.Add("use_search", "true")
+		q.Add("search_focus", "web")
+		q.Add("enable_web_results", "true")
 	} else {
 		// 修改：默认模型: 使用selectedAiModel和selectedChatMode=custom
 		fmt.Printf("使用默认模型: %s (映射为: %s)\n", openAIReq.Model, mapModelName(openAIReq.Model))
@@ -1008,7 +1066,7 @@ func handleNonStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 		ID:      "chatcmpl-" + fmt.Sprintf("%d", time.Now().Unix()),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   reverseMapModelName(mapModelName(originalModel)), // 映射回 OpenAI 模型名称
+		Model:   originalModel, // 直接返回用户原始请求的模型名（包括-search后缀）
 		Choices: []OpenAIChoice{
 			{
 				Message: Message{
@@ -1060,7 +1118,7 @@ func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 				ID:      "chatcmpl-" + fmt.Sprintf("%d", time.Now().Unix()),
 				Object:  "chat.completion.chunk",
 				Created: time.Now().Unix(),
-				Model:   reverseMapModelName(mapModelName(originalModel)), // 映射回 OpenAI 模型名称
+				Model:   originalModel, // 直接返回用户原始请求的模型名（包括-search后缀）
 				Choices: []Choice{
 					{
 						Delta: Delta{
