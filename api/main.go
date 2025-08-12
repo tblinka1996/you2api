@@ -186,7 +186,6 @@ var modelMap = map[string]string{
 	"grok-3-beta":	   "grok_3",
 	"grok-3-mini":	   "grok_3_mini",
 	"grok-2":	   "grok_2",
-	"grok-3-mini-beta":	   "grok_3_mini",
         "nous-hermes-2":	   "nous_hermes_2",
 }
 
